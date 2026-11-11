@@ -1,0 +1,389 @@
+openapi: 3.0.3
+info:
+  title: Shop Payments API
+  version: 1.0.0
+  description: |
+    Кейс: оплата заказа интернет-магазина через внешний платёжный шлюз
+    (сценарий по мотивам ЮKassa, контракт упрощён).
+
+    Принципы:
+    * Создание платежа - синхронный вызов, результат оплаты приходит асинхронно через вебхук.
+    * Источник истины о статусе платежа - вебхук шлюза (с проверкой), а не редирект браузера.
+    * Создание платежа идемпотентно (заголовок `Idempotency-Key`).
+servers:
+  - url: https://shop.example.com
+    description: Mock server
+tags:
+  - name: Payments
+    description: Создание платежей (вызывает наш фронтенд)
+  - name: Webhooks
+    description: Уведомления от платёжного шлюза (вызывает шлюз)
+
+paths:
+  /api/payments:
+    post:
+      tags: [Payments]
+      operationId: createPayment
+      summary: Создать платёж по заказу
+      description: |
+        Проверяет заказ, создаёт платёж в шлюзе и возвращает ссылку, на которую
+        нужно перенаправить клиента для ввода данных карты.
+        Статус платежа в ответе всегда `pending` - итог придёт вебхуком.
+
+        Повторный запрос с тем же `Idempotency-Key` и тем же телом возвращает
+        ранее созданный платёж (200) и не создаёт дубль.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Уникальный ключ операции, генерируется клиентом (UUID v4).
+          schema:
+            type: string
+            format: uuid
+          example: 7b0f6c1e-5a3d-4c8e-9f21-0d4a6e8b1c33
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePaymentRequest'
+            examples:
+              success:
+                summary: Корректный запрос
+                value:
+                  order_id: ORD-2026-000123
+                  amount: "2490.00"
+                  currency: RUB
+                  description: "Оплата заказа №ORD-2026-000123"
+                  return_url: https://shop.example.com/orders/ORD-2026-000123
+              invalidAmount:
+                summary: Некорректная сумма
+                value:
+                  order_id: ORD-2026-000123
+                  amount: "-10.00"
+                  currency: RUB
+                  return_url: https://shop.example.com/orders/ORD-2026-000123
+      responses:
+        '200':
+          description: Повторный запрос с тем же Idempotency-Key - возвращён ранее созданный платёж.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatePaymentResponse'
+        '201':
+          description: Платёж создан, ожидает оплаты клиентом.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatePaymentResponse'
+              example:
+                payment_id: 2f6a9c34-000f-5000-8000-1c5b7e2d9a10
+                order_id: ORD-2026-000123
+                status: pending
+                amount: "2490.00"
+                currency: RUB
+                confirmation_url: https://pay.gateway.example/checkout?payment=2f6a9c34-000f-5000-8000-1c5b7e2d9a10
+                created_at: "2026-11-11T10:15:30Z"
+        '400':
+          description: Ошибка валидации запроса (отсутствует поле, неверный формат, сумма <= 0, неподдерживаемая валюта).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: VALIDATION_ERROR
+                  message: Запрос содержит некорректные данные
+                  details:
+                    - field: amount
+                      issue: Сумма должна быть больше 0
+                  trace_id: 9d1c0b7a4e2f4a6b
+        '401':
+          description: Не передан или недействителен токен авторизации.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: UNAUTHORIZED
+                  message: Требуется авторизация
+                  trace_id: 3a7e5c1d9b2f4e60
+        '404':
+          description: Заказ не найден.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: ORDER_NOT_FOUND
+                  message: Заказ ORD-2026-000123 не найден
+                  trace_id: 5c2b8e0f7a1d4c93
+        '409':
+          description: |
+            Конфликт: заказ уже оплачен (`ORDER_ALREADY_PAID`) либо Idempotency-Key
+            уже использован с другим телом запроса (`IDEMPOTENCY_KEY_CONFLICT`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: ORDER_ALREADY_PAID
+                  message: Заказ уже оплачен
+                  trace_id: 8e4d1a6c2b7f4d05
+        '502':
+          description: Платёжный шлюз недоступен или не ответил за отведённое время. Запрос можно повторить с тем же Idempotency-Key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: GATEWAY_UNAVAILABLE
+                  message: Платёжный сервис временно недоступен, повторите запрос
+                  trace_id: 1b9f3d5e7c2a4e68
+
+  /api/webhooks/payment-status:
+    post:
+      tags: [Webhooks]
+      operationId: receivePaymentStatus
+      summary: Принять уведомление о статусе платежа от шлюза
+      description: |
+        Вызывается платёжным шлюзом при смене статуса платежа на конечный
+        (`succeeded` или `canceled`).
+
+        Требования к обработчику:
+        1. Проверить подпись `X-Signature` (HMAC-SHA256 от тела запроса).
+        2. Отбросить дубли по `event_id` (шлюз может прислать одно событие несколько раз).
+        3. Перепроверить статус запросом к API шлюза, не доверяя только телу вебхука.
+        4. Обновить платёж и заказ в одной транзакции.
+        5. Быстро ответить `200` (тяжёлую работу - в фон).
+
+        Любой ответ, кроме 2xx, шлюз считает неуспешной доставкой и повторяет
+        отправку с нарастающей задержкой.
+      security:
+        - webhookSignature: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentStatusEvent'
+            examples:
+              succeeded:
+                summary: Платёж успешно оплачен
+                value:
+                  event_id: c4e2a8f0-6b1d-4f37-a9c5-2d7e1b0f8a46
+                  event: payment.succeeded
+                  created_at: "2026-11-11T10:17:02Z"
+                  payment:
+                    id: 2f6a9c34-000f-5000-8000-1c5b7e2d9a10
+                    order_id: ORD-2026-000123
+                    status: succeeded
+                    amount: "2490.00"
+                    currency: RUB
+                    paid_at: "2026-11-11T10:17:01Z"
+              canceledInsufficientFunds:
+                summary: Платёж отклонён - недостаточно средств
+                value:
+                  event_id: 91b7d3e5-2a4c-4e86-b0f1-7c3a5d9e2b64
+                  event: payment.canceled
+                  created_at: "2026-11-11T10:17:02Z"
+                  payment:
+                    id: 2f6a9c34-000f-5000-8000-1c5b7e2d9a10
+                    order_id: ORD-2026-000123
+                    status: canceled
+                    amount: "2490.00"
+                    currency: RUB
+                    failure_reason: insufficient_funds
+      responses:
+        '200':
+          description: Событие принято (обработано или является дублем).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+              example:
+                received: true
+        '400':
+          description: Тело запроса не соответствует контракту.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: VALIDATION_ERROR
+                  message: Некорректное тело уведомления
+                  details:
+                    - field: payment.status
+                      issue: Недопустимое значение статуса
+                  trace_id: 6d0a2c4e8b1f4a79
+        '401':
+          description: Подпись отсутствует или неверна - уведомление отклонено.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: INVALID_SIGNATURE
+                  message: Подпись уведомления не прошла проверку
+                  trace_id: 4f8b1d3a5c7e4290
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    webhookSignature:
+      type: apiKey
+      in: header
+      name: X-Signature
+      description: HMAC-SHA256 от сырого тела запроса, ключ - общий секрет магазина и шлюза.
+
+  schemas:
+    CreatePaymentRequest:
+      type: object
+      required: [order_id, amount, currency, return_url]
+      properties:
+        order_id:
+          type: string
+          maxLength: 64
+          description: Идентификатор заказа в нашей системе.
+          example: ORD-2026-000123
+        amount:
+          type: string
+          pattern: '^\d{1,10}\.\d{2}$'
+          description: Сумма строкой с двумя знаками после точки (чтобы избежать ошибок округления float).
+          example: "2490.00"
+        currency:
+          $ref: '#/components/schemas/Currency'
+        description:
+          type: string
+          maxLength: 128
+          description: Описание платежа для клиента.
+        return_url:
+          type: string
+          format: uri
+          description: Куда шлюз вернёт клиента после оплаты.
+
+    CreatePaymentResponse:
+      type: object
+      required: [payment_id, order_id, status, amount, currency, confirmation_url, created_at]
+      properties:
+        payment_id:
+          type: string
+          description: Идентификатор платежа в шлюзе.
+        order_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        amount:
+          type: string
+          example: "2490.00"
+        currency:
+          $ref: '#/components/schemas/Currency'
+        confirmation_url:
+          type: string
+          format: uri
+          description: Адрес страницы оплаты шлюза, на которую нужно перенаправить клиента.
+        created_at:
+          type: string
+          format: date-time
+
+    PaymentStatusEvent:
+      type: object
+      required: [event_id, event, created_at, payment]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          description: Уникальный идентификатор события, используется для дедупликации.
+        event:
+          type: string
+          enum: [payment.succeeded, payment.canceled]
+        created_at:
+          type: string
+          format: date-time
+        payment:
+          type: object
+          required: [id, order_id, status, amount, currency]
+          properties:
+            id:
+              type: string
+              description: Идентификатор платежа в шлюзе (совпадает с payment_id).
+            order_id:
+              type: string
+            status:
+              type: string
+              enum: [succeeded, canceled]
+            amount:
+              type: string
+              example: "2490.00"
+            currency:
+              $ref: '#/components/schemas/Currency'
+            paid_at:
+              type: string
+              format: date-time
+              description: Время оплаты (только для succeeded).
+            failure_reason:
+              type: string
+              description: Причина отказа (только для canceled).
+              enum:
+                - insufficient_funds
+                - card_expired
+                - three_ds_failed
+                - rejected_by_issuer
+                - expired_by_timeout
+                - other
+
+    WebhookAck:
+      type: object
+      required: [received]
+      properties:
+        received:
+          type: boolean
+
+    PaymentStatus:
+      type: string
+      description: |
+        pending - ожидает оплаты, succeeded - оплачен, canceled - отклонён или отменён.
+      enum: [pending, succeeded, canceled]
+
+    Currency:
+      type: string
+      enum: [RUB, USD, EUR]
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Машиночитаемый код ошибки.
+              example: VALIDATION_ERROR
+            message:
+              type: string
+              description: Описание для человека.
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field:
+                    type: string
+                  issue:
+                    type: string
+            trace_id:
+              type: string
+              description: Идентификатор для поиска запроса в логах.
